@@ -8,10 +8,10 @@ setup(
     description="VQAEs for Text",
     url="",  # Add the URL of your package here
     classifiers=[
-        "Framework :: Django",
+        "Framework :: Pytorch",
         "Programming Language :: Python :: 3",
     ],
-    python_requires=">=3.7",
+    python_requires=">=3.9",
     packages=find_packages(),
     install_requires=[
         "transformers",
@@ -23,6 +23,5 @@ setup(
     extras_require={
         "train": ["accelerate", "wandb"]
     },
-    keywords=["one", "two"],
     license="MIT"
 )

@@ -29,3 +29,10 @@ recon = model.detokenize(tokens)
 print(recon)
 # ['Hello world!']
 ```
+
+
+# TODO
+- [ ] Dataloader with HF datasets
+- [ ] Add training 
+- [ ] AR and discrete diffusion decoders
+- [ ] Variational bottleneck

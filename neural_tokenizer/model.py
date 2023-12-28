@@ -4,10 +4,15 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange
-import flash_attn
 from transformers import PretrainedConfig, PreTrainedModel
 
-from neural_tokenizer.fsq import FSQ
+try:
+    import flash_attn
+    flash_attn_available = True
+except ImportError:
+    print("WARNING: flash_attn not installed, expect non valid results")
+    flash_attn_available = False
+
 
 def zero_init(layer):
     nn.init.zeros_(layer.weight)
@@ -121,6 +126,7 @@ class Patch(nn.Module):
         in_size: int,
         out_size: int,
         factor: int,
+        zero_out: bool = False,
     ):
         super().__init__()
 
@@ -129,7 +135,8 @@ class Patch(nn.Module):
         if not self.is_encoder:
             self.factor = 1 / factor
             
-        self.proj = nn.Linear(in_size, out_size, bias=False)
+        init = xavier_init if not zero_out else zero_init
+        self.proj = init(nn.Linear(in_size, out_size, bias=False))
 
     def forward(self, x: Tensor) -> Tensor:
         if self.is_encoder:
@@ -148,14 +155,12 @@ class Mlp(nn.Module):
         out_size: int,
         mlp_factor: int,
         norm: bool,
-        zero_out: bool = False,
     ):
         super().__init__()
-        out_init = xavier_init if not zero_out else zero_init
         self.net = nn.Sequential(
             xavier_init(nn.Linear(in_size, in_size * mlp_factor, bias=False)),
             nn.GELU(),
-            out_init(nn.Linear(in_size * mlp_factor, out_size, bias=False)),
+            xavier_init(nn.Linear(in_size * mlp_factor, out_size, bias=False)),
         )
         self.norm = norm
         if self.norm:
@@ -207,12 +212,14 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, "b h s d -> b s h d"), (q, k, v))
 
-        x = flash_attn.flash_attn_func(
-            q=q,
-            k=k,
-            v=v,
-            window_size=(self.window_size, self.window_size),
-        )
+        if flash_attn_available:
+            x = flash_attn.flash_attn_func(
+                q=q,
+                k=k,
+                v=v,
+                window_size=(self.window_size, self.window_size),
+            )
+            
         x = rearrange(x, "b s h d -> b s (h d)")
         x = self.out_proj.forward(x)
         return x + residual
@@ -222,19 +229,25 @@ class Block(nn.Module):
     """ patch, attention, and mlp """
     def __init__(
         self,
-        in_size: Tensor,
-        out_size: Tensor,
+        in_size: int,
+        out_size: int,
         num_heads: int,
         factor: int,
         mlp_factor: int,
         window_size: int,
         embed_pos: bool,
         norm: bool,
-        zero_out: bool = False,
+        zero_out: bool,
     ):
         super().__init__()
 
-        self.patch = Patch(factor=factor) if factor > 1 else nn.Identity()
+        self.patch = Patch(
+            in_size=in_size,
+            out_size=out_size,
+            factor=factor,
+            zero_out=zero_out,
+        ) if factor > 1 else nn.Identity()
+
         self.attn = Attention(
             size=in_size,
             num_heads=num_heads,
@@ -247,7 +260,6 @@ class Block(nn.Module):
             out_size=out_size,
             mlp_factor=mlp_factor,
             norm=norm,
-            zero_out=zero_out,
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -257,6 +269,80 @@ class Block(nn.Module):
         x = self.patch.forward(x) if not self.patch.is_encoder else x
         return x
 
+
+""" Quantizer """
+
+def round_ste(z: torch.Tensor) -> torch.Tensor:
+    """Round with straight through gradients."""
+    zhat = z.round()
+    return z + (zhat - z).detach()
+
+
+class FSQ(nn.Module):
+    def __init__(self, in_size: int, levels: list[int]):
+        super().__init__()
+        _levels = torch.tensor(levels, dtype=torch.int32)
+        self.register_buffer("_levels", _levels)
+        self._levels: Tensor
+
+        _basis = torch.cumprod(
+            torch.tensor([1] + levels[:-1]), dim=0, dtype=torch.int32
+        )
+        self.register_buffer("_basis", _basis)
+        self._basis: Tensor
+
+        self.dim = len(levels)
+
+        self.in_proj = nn.Linear(in_size, self.dim, bias=True)
+        self.out_proj = nn.Linear(self.dim, in_size, bias=True)
+
+        self.n_codes = self._levels.prod().item()
+        implicit_codebook = self.indices_to_codes(torch.arange(self.n_codes))
+        self.register_buffer("implicit_codebook", implicit_codebook)
+        
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        z = self.in_proj.forward(z)
+        zhat = self.quantize(z)
+        indices = self.codes_to_indices(zhat)
+        zhat = self.out_proj.forward(zhat)
+        return zhat, indices
+
+    def bound(self, z: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+        """Bound `z`, an array of shape (..., d)."""
+        half_l = (self._levels - 1) * (1 - eps) / 2
+        offset = torch.where(self._levels % 2 == 0, 0.5, 0.0)
+        shift = (offset / half_l).tan()
+        return (z + shift).tanh() * half_l - offset
+
+    def quantize(self, z: torch.Tensor) -> torch.Tensor:
+        """Quanitzes z, returns quantized zhat, same shape as z."""
+        quantized = round_ste(self.bound(z))
+        half_width = self._levels // 2  # Renormalize to [-1, 1].
+        return quantized / half_width
+
+    def _scale_and_shift(self, zhat_normalized: torch.Tensor) -> torch.Tensor:
+        half_width = self._levels // 2
+        return (zhat_normalized * half_width) + half_width
+
+    def _scale_and_shift_inverse(self, zhat: torch.Tensor) -> torch.Tensor:
+        half_width = self._levels // 2
+        return (zhat - half_width) / half_width
+
+    def codes_to_indices(self, zhat: torch.Tensor) -> torch.Tensor:
+        """Converts a `code` to an index in the codebook."""
+        assert zhat.shape[-1] == self.dim
+        zhat = self._scale_and_shift(zhat)
+        return (zhat * self._basis).sum(dim=-1).to(torch.int32)
+
+    def indices_to_codes(self, indices: torch.Tensor) -> torch.Tensor:
+        """Inverse of `codes_to_indices`."""
+        indices = indices.unsqueeze(-1)
+        codes_non_centered = (indices // self._basis) % self._levels
+        out = self._scale_and_shift_inverse(codes_non_centered)
+        return self.out_proj.forward(out)
+
+
+""" Main """
 
 class NeuralTokenizerConfig(PretrainedConfig):
     model_type = "neural_tokenizer"
@@ -290,11 +376,13 @@ class NeuralTokenizerConfig(PretrainedConfig):
         self.zero_out = zero_out
 
 
-class NeuralTokenizerModel(PreTrainedModel):
+class NeuralTokenizer(PreTrainedModel):
     
     config_class = NeuralTokenizerConfig
     
     def __init__(self, config: NeuralTokenizerConfig):
+        super().__init__(config)
+
         num_layers = len(config.hidden_sizes)
         self.encoder = nn.Sequential(
             nn.Embedding(config.char_vocab_size, config.hidden_sizes[0]),
@@ -316,6 +404,7 @@ class NeuralTokenizerModel(PreTrainedModel):
             levels=config.quantizer_levels,
         )
         
+        head_init = zero_init if config.zero_out else xavier_init
         self.decoder = nn.Sequential(
             *[Block(
                 in_size=config.latent_size,
@@ -327,28 +416,46 @@ class NeuralTokenizerModel(PreTrainedModel):
                 embed_pos=config.embed_pos,
                 norm=config.norm,
                 zero_out=config.zero_out if i < num_layers - 1 else False,
-            ) for i in range(num_layers - 1, -1, -1)],
+            ) for i in range(num_layers - 1, -1, -1)] + [
+                head_init(nn.Linear(config.hidden_sizes[0], config.char_vocab_size, bias=False))
+            ]
         )
-        
-        head_init = zero_init if config.zero_out else xavier_init
-        self.lm_head = head_init(nn.Linear(config.hidden_sizes[0], config.char_vocab_size, bias=False))
-        
+    
+    @staticmethod
+    def char_tokenize(x: list[str]) -> Tensor:
+        """ Takes a list of strings and returns utf8 indices as nested tensor for var len """
+        x = [torch.tensor(list(map(ord, s)), dtype=torch.long) for s in x]
+        x = torch.nested.nested_tensor(x)
+        return x
+
+    @staticmethod
+    def char_detokenize(z: Tensor) -> list[str]:
+        """ Takes char lvl utf 8 nested tensor indices and returns list of strings """
+        out = [''.join(map(chr, t.tolist())) for t in z]
+        return out
+    
     @torch.inference_mode()
     def encode(self, x: list[str]) -> Tensor:
-        latent = self.encoder.forward(x)
-        indices = self.quantizer.codes_to_indices(latent)
+        char_indices = self.char_tokenize(x)
+        codes = self.encoder.forward(char_indices)
+        indices = self.quantizer.codes_to_indices(codes)
         return indices
     
     @torch.inference_mode()
     def decode(self, indices: Tensor) -> list[str]:
         latent = self.quantizer.indices_to_codes(indices)
-        x = self.decoder.forward(latent)
-        x = self.lm_head.forward(x)
-        return x
+        logits = self.decoder.forward(latent)
+
+        # sample logits # TODO
+        y = torch.argmax(logits, dim=-1)
+
+        y = self.char_detokenize(y)
+        return y
     
     def forward(self, x: list[str]) -> Tensor:
-        latent = self.encoder.forward(x)
-        q_latent = self.quantizer.forward(latent)
-        recon = self.decoder.forward(q_latent)
-        xe_loss = F.cross_entropy(recon, torch.tensor(x))
+        char_indices = self.char_tokenize(x)
+        codes = self.encoder.forward(char_indices)
+        latent = self.quantizer.forward(codes)
+        logits = self.decoder.forward(latent)
+        xe_loss = F.cross_entropy(logits, char_indices).mean()
         return xe_loss
