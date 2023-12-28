@@ -1,3 +1,5 @@
+# Loading
+```
 # neural-tokenizer
 High compression text tokenizers via VQAEs for efficient and democratic language modeling.
 
@@ -20,19 +22,19 @@ model = NeuralTokenizer.from_pretrained("elyxlz/neural-tokenizer-v1")
 
 # Usage
 ```python
-text = ["Hello world!"]
-tokens = model.tokenize(text)
-print(tokens)
-# [[0, 1235, 1236, 1]]
+text = ["Hello", "World :)"]
+tokens = model.encode(text)
+print(tokens.data)
+# [[0, 1235, d1236, 1], [0, 1237, 1238, 1239, 1240, 1]]
 
-recon = model.detokenize(tokens)
+recon = model.decode(tokens)
 print(recon)
-# ['Hello world!']
+# ["Hello", "World :)"]
 ```
-
 
 # TODO
 - [ ] Dataloader with HF datasets
 - [ ] Add training 
 - [ ] AR and discrete diffusion decoders
-- [ ] Variational bottleneck
+- [ ] Variational + continuous bottleneck
+- [ ] Replace SparseTensor abstract class with torch nested tensors once they mature
