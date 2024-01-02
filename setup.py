@@ -6,7 +6,7 @@ setup(
     author="Elio Pascarelli",
     author_email="elio@pascarelli.com",
     description="VQAEs for Text",
-    url="",  # Add the URL of your package here
+    url="",
     classifiers=[
         "Framework :: Pytorch",
         "Programming Language :: Python :: 3",

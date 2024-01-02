@@ -4,15 +4,77 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import PretrainedConfig, PreTrainedModel
+import math
+from transformers import PreTrainedModel
+
+from .config import NeuralTokenizerConfig
 
 try:
     import flash_attn
 
     flash_attn_available = True
 except ImportError:
-    print("WARNING: flash_attn not installed, expect non valid results")
     flash_attn_available = False
+    print("\033[91mWARNING: flash_attn not installed, expect non valid results\033[0m")
+
+
+import inspect
+import pdb
+import functools
+
+""" debug """
+
+def debug_func(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            print(
+                "Error encountered! Starting debug session from the beginning of the function."
+            )
+            pdb.runcall(func, *args, **kwargs)
+
+    return wrapper
+
+
+def trace():
+    frame = inspect.currentframe().f_back
+    pdb.Pdb().set_trace(frame)
+
+
+
+""" helper """
+
+
+def find_multiple(x: int, n: int) -> int:
+    """Finds the smallest multiple of n greater than or equal to x, e.g. find_multiple(5, 3) = 6"""
+    return math.ceil(x / n) * n
+
+
+def pad_tensors(
+    tensors: list[Tensor],
+    max_len: int = None,
+    pad_value: int = -1,
+) -> tuple[Tensor, Tensor]:
+    """
+    Pad every item in the sequence to a the longest item in the batch.
+    """
+
+    longest = max([t.size(0) for t in tensors]) if max_len is None else max_len
+    tensors = torch.stack(
+        [F.pad(t, (0, longest - t.shape[0]), value=pad_value) for t in tensors]
+    )
+    mask = torch.stack([t != pad_value for t in tensors])
+    return tensors, mask
+
+
+def unpad_tensors(tensors: Tensor, mask: Tensor) -> list[Tensor]:
+    """Unbinds and unpads stacked tensors"""
+    tensors = tensors.unbind(dim=0)
+    mask = mask.unbind(dim=0)
+    out = [t[m] for t, m in zip(tensors, mask)]
+    return out
 
 
 def zero_init(layer):
@@ -36,11 +98,6 @@ def rms_norm(x, scale, eps):
     return x * scale.to(x.dtype)
 
 
-def find_multiple(x: int, n: int) -> int:
-    """Finds the smallest multiple of n greater than x, e.g. find_multiple(5, 3) = 6"""
-    return (x // n + 1) * n
-
-
 def rotate_half(x: Tensor):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -58,39 +115,6 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-class SparseTensor:
-    """Abstract class to conveniently managed padded tensors with masks, used for varlen inputs """
-
-    def __init__(
-        self,
-        data: Tensor,
-        mask: Tensor,
-    ):
-        self.data = data
-        self.mask = mask
-
-        assert mask.dtype == torch.bool
-
-    def __iter__(self):
-        return iter((self.data, self.mask))
-
-    @classmethod
-    def from_unbinded(cls, data: list[Tensor], max_len: int = None) -> "SparseTensor":
-        """Pad list of tensors and create mask to return SparseTensor"""
-        longest = max([t.shape[0] for t in data]) if max_len is None else max_len
-        # left pad with 0s
-        data = [F.pad(t, (0,  longest - t.shape[0])) for t in data]
-        mask = [t != 0 for t in data]
-        return cls(torch.stack(data), torch.stack(mask))
-
-    def unbind(self) -> list[Tensor]:
-        """Unbinds and unpads self"""
-        data = self.data.unbind(dim=0)
-        mask = self.mask.unbind(dim=0)
-        out = [t[m] for t, m in zip(data, mask)]
-        return out
 
 
 class RotaryEmbedding(nn.Module):
@@ -168,52 +192,48 @@ class Patch(nn.Module):
         zero_out: bool = False,
     ):
         super().__init__()
-
-        self.is_encoder = factor > 1
         self.factor = factor
-        if not self.is_encoder:
-            self.factor = 1 / factor
+        self.is_encoder = out_size >= in_size
 
-        init = xavier_init if not zero_out else zero_init
-        self.proj = init(nn.Linear(in_size, out_size, bias=False))
+        proj_size = out_size // factor if self.is_encoder else out_size * factor
+        self.proj = xavier_init(nn.Linear(in_size, proj_size))
 
-    def forward(self, x: SparseTensor) -> SparseTensor:
-        data, mask = x
+        if zero_out:
+            nn.init.zeros_(self.proj.weight)
+
+    def forward(self, x: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        x = self.proj.forward(x)
         if self.is_encoder:
-            data = self.proj.forward(data)
-            data = rearrange(data, "b s (p d) -> b (s p) d", p=self.factor)
+            x = rearrange(x, "b (s p) d -> b s (p d)", p=self.factor)
             mask = mask[:, :: self.factor]
         else:
-            data = rearrange(data, "b (s p) d -> b s (p d)", p=self.factor)
-            data = self.proj.forward(data)
+            x = rearrange(x, "b s (p d) -> b (s p) d", p=self.factor)
             mask = torch.repeat_interleave(mask, self.factor, dim=1)
-        return SparseTensor(data, mask)
+
+        return x, mask
 
 
 class Mlp(nn.Module):
     def __init__(
         self,
-        in_size: int,
-        out_size: int,
+        size: int,
         mlp_factor: int,
         norm: bool,
     ):
         super().__init__()
         self.net = nn.Sequential(
-            xavier_init(nn.Linear(in_size, in_size * mlp_factor, bias=False)),
+            xavier_init(nn.Linear(size, size * mlp_factor, bias=False)),
             nn.GELU(),
-            xavier_init(nn.Linear(in_size * mlp_factor, out_size, bias=False)),
+            xavier_init(nn.Linear(size * mlp_factor, size, bias=False)),
         )
         self.norm = norm
         if self.norm:
-            self.norm1 = RMSNorm(in_size)
+            self.norm1 = RMSNorm(size)
 
-    def forward(self, x: SparseTensor) -> SparseTensor:
-        data, mask = x
-        residual = data
-        data = self.norm1.forward(data) if self.norm else data
-        out = self.net(data) + residual
-        return SparseTensor(out, mask)
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        x = self.norm1.forward(x) if self.norm else x
+        return self.net(x) + residual
 
 
 class Attention(nn.Module):
@@ -238,17 +258,15 @@ class Attention(nn.Module):
 
         self.norm = norm
         if self.norm:
-            self.norm1 = RMSNorm(self.head_size)
+            self.norm1 = RMSNorm(size)
 
         self.window_size = window_size
 
-    # TODO: involve mask
     # TODO: varlen flash attn func
-    def forward(self, x: SparseTensor) -> SparseTensor:
-        data, mask = x
-        residual = data
-        data = self.norm1.forward(data) if self.norm else data
-        qkv = self.qkv_proj.forward(data)
+    def forward(self, x: Tensor, mask: Tensor) -> Tensor:
+        residual = x
+        x = self.norm1.forward(x) if self.norm else x
+        qkv = self.qkv_proj.forward(x)
         qkv = rearrange(qkv, "b s (n h d) -> b n h s d", n=3, h=self.num_heads)
         q, k, v = qkv.unbind(dim=1)
 
@@ -261,18 +279,18 @@ class Attention(nn.Module):
 
         # use flash attn package until F.sdpa supports windowed attention
         if flash_attn_available:
-            data = flash_attn.flash_attn_func(
+            x = flash_attn.flash_attn_func(
                 q=q,
                 k=k,
                 v=v,
                 window_size=(self.window_size, self.window_size),
-                #mask=mask,
+                # mask=mask,
             )
+            x = rearrange(x, "b s h d -> b s (h d)")
 
-        data = rearrange(data, "b s h d -> b s (h d)")
-        data = self.out_proj.forward(data)
-        data += residual
-        return SparseTensor(data, mask)
+        x = self.out_proj.forward(x)
+        x += residual
+        return x
 
 
 class Block(nn.Module):
@@ -304,75 +322,138 @@ class Block(nn.Module):
         )
 
         self.attn = Attention(
-            size=in_size,
+            size=out_size if self.patch.is_encoder else in_size,
             num_heads=num_heads,
             window_size=window_size,
             embed_pos=embed_pos,
             norm=norm,
         )
         self.mlp = Mlp(
-            in_size=in_size,
-            out_size=out_size,
+            size=out_size if self.patch.is_encoder else in_size,
             mlp_factor=mlp_factor,
             norm=norm,
         )
 
-    def forward(self, x: SparseTensor) -> SparseTensor:
-        x = self.patch.forward(x) if self.patch.is_encoder else x
-        x = self.attn.forward(x)
+    def forward(self, x: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        x, mask = self.patch.forward(x, mask) if self.patch.is_encoder else (x, mask)
+        x = self.attn.forward(x, mask)
         x = self.mlp.forward(x)
-        x = self.patch.forward(x) if not self.patch.is_encoder else x
-        return x
+        x, mask = (
+            self.patch.forward(x, mask) if not self.patch.is_encoder else (x, mask)
+        )
+        return x, mask
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        config: NeuralTokenizerConfig,
+    ):
+        super().__init__()
+
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    in_size=config.hidden_sizes[i],
+                    out_size=config.hidden_sizes[i + 1]
+                    if i < config.num_layers - 1
+                    else config.latent_size,
+                    num_heads=config.num_heads,
+                    factor=config.factors[i],
+                    mlp_factor=config.mlp_factor,
+                    window_size=config.window_size,
+                    embed_pos=config.embed_pos,
+                    norm=config.norm,
+                    zero_out=False,
+                )
+                for i in range(config.num_layers)
+            ],
+        )
+
+    def forward(self, x: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        for block in self.blocks:
+            block: Block
+            x, mask = block.forward(x, mask)
+        return x, mask
+
+
+class Decoder(nn.Module):
+    def __init__(
+        self,
+        config: NeuralTokenizerConfig,
+    ):
+        super().__init__()
+
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    in_size=config.hidden_sizes[i + 1]
+                    if i < config.num_layers - 1
+                    else config.latent_size,
+                    out_size=config.hidden_sizes[i],
+                    num_heads=config.num_heads,
+                    factor=config.factors[i],
+                    mlp_factor=config.mlp_factor,
+                    window_size=config.window_size,
+                    embed_pos=config.embed_pos,
+                    norm=config.norm,
+                    zero_out=config.zero_out if i < config.num_layers - 1 else False,
+                )
+                for i in range(config.num_layers - 1, -1, -1)
+            ]
+        )
+
+    def forward(self, x: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        for block in self.blocks:
+            x, mask = block.forward(x, mask)
+        return x, mask
 
 
 """ Quantizer """
 
 
-def round_ste(z: Tensor) -> Tensor:
-    """Round with straight through gradients."""
-    zhat = z.round()
-    return z + (zhat - z).detach()
-
-
 class FSQ(nn.Module):
-    def __init__(self, in_size: int, levels: list[int]):
+    def __init__(
+        self,
+        config: NeuralTokenizerConfig,
+    ):
         super().__init__()
+
+        levels = config.quantizer_levels
+        dim = config.latent_size
+
         _levels = torch.tensor(levels, dtype=torch.int32)
         self.register_buffer("_levels", _levels)
-        self._levels: Tensor
+
+        self.dim = dim
 
         _basis = torch.cumprod(
-            Tensor([1] + levels[:-1]), dim=0, dtype=torch.int32
+            torch.tensor([1] + levels[:-1]), dim=0, dtype=torch.int32
         )
         self.register_buffer("_basis", _basis)
-        self._basis: Tensor
 
-        self.dim = len(levels)
+        codebook_dim = len(levels)
+        self.codebook_dim = codebook_dim
 
-        self.in_proj = nn.Linear(in_size, self.dim, bias=True)
-        self.out_proj = nn.Linear(self.dim, in_size, bias=True)
+        self.in_proj = nn.Linear(self.dim, codebook_dim)
+        self.out_proj = nn.Linear(codebook_dim, self.dim)
 
         self.n_codes = self._levels.prod().item()
-        # implicit_codebook = self.indices_to_codes(torch.arange(self.n_codes))
-        # self.register_buffer("implicit_codebook", implicit_codebook)
-
-    def forward(self, z: SparseTensor) -> SparseTensor:
-        data, mask = z
-        data = self.in_proj.forward(data)
-        zhat = self.quantize(data)
-        zhat = self.out_proj.forward(zhat)
-        return SparseTensor(zhat, mask)
+        implicit_codebook = self.indices_to_codes(torch.arange(self.n_codes))
+        self.register_buffer("implicit_codebook", implicit_codebook)
 
     def bound(self, z: Tensor, eps: float = 1e-3) -> Tensor:
         """Bound `z`, an array of shape (..., d)."""
         half_l = (self._levels - 1) * (1 - eps) / 2
         offset = torch.where(self._levels % 2 == 0, 0.5, 0.0)
-        shift = (offset / half_l).tan()
+        shift = (offset / half_l).atanh()
         return (z + shift).tanh() * half_l - offset
 
     def quantize(self, z: Tensor) -> Tensor:
-        """Quanitzes z, returns quantized zhat, same shape as z."""
-        quantized = round_ste(self.bound(z))
+        """Quantizes z, returns quantized zhat, same shape as z."""
+        z = self.bound(z)
+        zhat = z.round()
+        quantized = zhat + (z - zhat).detach()  # STE
         half_width = self._levels // 2  # Renormalize to [-1, 1].
         return quantized / half_width
 
@@ -384,55 +465,41 @@ class FSQ(nn.Module):
         half_width = self._levels // 2
         return (zhat - half_width) / half_width
 
-    def codes_to_indices(self, zhat: SparseTensor) -> SparseTensor:
-        """Converts a `code` to an index in the codebook."""
-        zhat, mask = zhat
-        assert zhat.shape[-1] == self.dim
-        zhat = self._scale_and_shift(zhat)
-        return SparseTensor((zhat * self._basis).sum(dim=-1).to(torch.int32), mask)
+    def codes_to_indices(self, z: Tensor) -> Tensor:
+        """Converts a raw `code` to an index in the codebook."""
 
-    def indices_to_codes(self, indices: SparseTensor) -> SparseTensor:
-        indices, mask = indices
+        z = self.in_proj.forward(z)
+        zhat = self.quantize(z)
+
+        assert (
+            zhat.shape[-1] == self.codebook_dim
+        ), f"expected dimension of {self.codebook_dim} but found dimension of {zhat.shape[-1]}"
+        zhat = self._scale_and_shift(zhat)
+        return (zhat * self._basis).sum(dim=-1).to(torch.int32)
+
+    def indices_to_codes(
+        self,
+        indices: Tensor,
+    ) -> Tensor:
         """Inverse of `codes_to_indices`."""
+
         indices = indices.unsqueeze(-1)
         codes_non_centered = (indices // self._basis) % self._levels
-        out = self._scale_and_shift_inverse(codes_non_centered)
-        return SparseTensor(self.out_proj.forward(out), mask)
+        codes = self._scale_and_shift_inverse(codes_non_centered)
+
+        return self.out_proj(codes)
+
+    def forward(self, z: Tensor) -> Tensor:
+        assert (
+            z.shape[-1] == self.dim
+        ), f"expected dimension of {self.dim} but found dimension of {z.shape[-1]}"
+        z = self.in_proj(z)
+        codes = self.quantize(z)
+        out = self.out_proj(codes)
+        return out
 
 
 """ Main """
-
-
-class NeuralTokenizerConfig(PretrainedConfig):
-    model_type = "neural_tokenizer"
-
-    def __init__(
-        self,
-        char_vocab_size: int = 256,
-        quantizer_levels: list[int] = [8, 8, 5, 3], # 960 vocab size
-        num_heads: int = 4,
-        hidden_sizes: list[int] = [32, 32, 64, 64],
-        latent_size: int = 128,
-        factors: list[int] = [2, 2, 2, 2],
-        mlp_factor: int = 2,
-        window_size: int = 128,
-        embed_pos: bool = True,
-        norm: bool = True,
-        zero_out: bool = False,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.char_vocab_size = char_vocab_size
-        self.quantizer_levels = quantizer_levels
-        self.num_heads = num_heads
-        self.hidden_sizes = hidden_sizes
-        self.latent_size = latent_size
-        self.mlp_factor = mlp_factor
-        self.factors = factors
-        self.window_size = window_size
-        self.embed_pos = embed_pos
-        self.norm = norm
-        self.zero_out = zero_out
 
 
 class NeuralTokenizer(PreTrainedModel):
@@ -441,84 +508,64 @@ class NeuralTokenizer(PreTrainedModel):
     def __init__(self, config: NeuralTokenizerConfig):
         super().__init__(config)
 
-        num_layers = len(config.hidden_sizes)
-
-        self.char_emb = nn.Embedding(config.char_vocab_size, config.hdiden_sizes[0])
-
-        self.encoder = nn.Sequential(
-            *[
-                Block(
-                    in_size=config.hidden_sizes[i],
-                    out_size=config.hidden_sizes[i + 1]
-                    if i < num_layers - 1
-                    else config.latent_size,
-                    num_heads=config.num_heads,
-                    factor=config.factors[i],
-                    mlp_factor=config.mlp_factor,
-                    window_size=config.window_size,
-                    embed_pos=config.embed_pos,
-                    norm=config.norm,
-                    zero_out=False,
-                )
-                for i in range(num_layers)
-            ],
+        self.char_embed = nn.Embedding(
+            config.char_vocab_size+1,
+            config.hidden_sizes[0],
+            padding_idx=config.char_vocab_size,
         )
 
-        self.quantizer = FSQ(
-            in_size=config.latent_size,
-            levels=config.quantizer_levels,
-        )
+        self.encoder = Encoder(config)
+
+        self.quantizer = FSQ(config)
+
+        self.decoder = Decoder(config)
 
         head_init = zero_init if config.zero_out else xavier_init
-        self.decoder = nn.Sequential(
-            *[
-                Block(
-                    in_size=config.latent_size,
-                    out_size=config.hidden_sizes[i],
-                    num_heads=config.num_heads,
-                    factor=config.factors[i],
-                    mlp_factor=config.mlp_factor,
-                    window_size=config.window_size,
-                    embed_pos=config.embed_pos,
-                    norm=config.norm,
-                    zero_out=config.zero_out if i < num_layers - 1 else False,
-                )
-                for i in range(num_layers - 1, -1, -1)
-            ]
+        self.head = head_init(
+            nn.Linear(config.hidden_sizes[0], config.char_vocab_size, bias=False)
         )
 
-        head_init = zero_init if config.zero_out else xavier_init
-        self.head = head_init(nn.Linear(config.hidden_sizes[0]), config.char_vocab_size, bias=False)
-
-    @staticmethod
-    def char_tokenize(x: list[str]) -> SparseTensor:
-        """Takes a list of strings and returns utf8 indices as SparseTensor for var len"""
+    def char_tokenize(self, x: list[str]) -> tuple[Tensor, Tensor]:
+        """Takes a list of strings and returns cumprod(factors) block sized utf8 indices to resist the patching mechanism, then globally pads to longest for varlen"""
         x = [torch.tensor(list(map(ord, s)), dtype=torch.long) for s in x]
-        x = SparseTensor.from_unbinded(x)
-        return x
 
-    @staticmethod
-    def char_detokenize(z: SparseTensor) -> list[str]:
-        """Takes char lvl utf 8 nested tensor indices and returns list of strings"""
-        out = ["".join(map(chr, t.tolist())) for t in z.unbind()]
+        # fakepad to block size
+        block_size = find_multiple(torch.cumprod(torch.tensor(self.config.factors), dim=0)[-1].item(), 8)
+        x = [torch.nn.functional.pad(s, (0, find_multiple(s.size(-1), block_size) - s.size(-1)), value=0) for s in x]
+        # assert x[0].size(-1) > 16, x[0].size(-1)
+
+        # real pad
+        x, mask = pad_tensors(x, pad_value=self.config.char_vocab_size)
+        return x, mask
+
+    def char_detokenize(self, z: Tensor, mask: Tensor) -> list[str]:
+        """Takes char lvl utf 8 indices and returns list of strings, removes fakepadding"""
+
+        z_unpadded = unpad_tensors(z, mask)
+        out = ["".join(map(chr, t.tolist())) for t in z_unpadded]
+
+        # remove fakepadding (\x00)
+        out = [s.replace("\x00", "") for s in out]
         return out
 
     @torch.inference_mode()
-    def encode(self, x: list[str]) -> SparseTensor:
-        char_indices = self.char_tokenize(x)
-        codes = self.encoder.forward(char_indices)
+    def encode(self, x: list[str]) -> tuple[Tensor, Tensor]:
+        char_indices, mask = self.char_tokenize(x)   
+        char_emb = self.char_embed.forward(char_indices)
+        codes, mask = self.encoder.forward(char_emb, mask)
         indices = self.quantizer.codes_to_indices(codes)
-        return indices
+        return indices, mask
 
     @torch.inference_mode()
-    def decode(self, indices: SparseTensor) -> list[str]:
+    def decode(self, indices: Tensor, mask: Tensor) -> list[str]:
         latent = self.quantizer.indices_to_codes(indices)
-        logits = self.decoder.forward(latent)
+        hidden, mask = self.decoder.forward(latent, mask)
+        logits = self.head.forward(hidden)
 
         # sample logits # TODO
         y = torch.argmax(logits, dim=-1)
 
-        y = self.char_detokenize(y)
+        y = self.char_detokenize(y, mask)
         return y
 
     def forward(self, x: list[str]) -> Tensor:
