@@ -8,15 +8,15 @@ class NeuralTokenizerConfig(PretrainedConfig):
         self,
         char_vocab_size: int = 256,
         quantizer_levels: list[int] = [8, 8, 5, 3],  # 960 vocab size
-        num_heads: int = 4,
-        hidden_sizes: list[int] = [16, 32, 64, 96],
-        latent_size: int = 128,
+        num_heads: int = 2,
+        hidden_sizes: list[int] = [4, 8, 16, 32],
+        latent_size: int = 48,
         factors: list[int] = [2, 2, 2, 2],
-        mlp_factor: int = 2,
-        window_size: int = 128,
-        embed_pos: bool = True,
-        norm: bool = True,
-        zero_out: bool = False,
+        mlp_factor: int = 1,
+        window_size: int = 32,
+        embed_pos: bool = False,
+        norm: bool = False,
+        zero_out: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)

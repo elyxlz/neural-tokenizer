@@ -20,6 +20,6 @@ setup(
         "python-dotenv",
         # "flash_attn",
     ],
-    extras_require={"train": ["accelerate", "wandb"]},
+    extras_require={"train": ["accelerate", "wandb", "datasets", "tqdm"]},
     license="MIT",
 )

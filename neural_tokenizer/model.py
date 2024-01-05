@@ -24,6 +24,7 @@ import functools
 
 """ debug """
 
+
 def debug_func(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -41,7 +42,6 @@ def debug_func(func):
 def trace():
     frame = inspect.currentframe().f_back
     pdb.Pdb().set_trace(frame)
-
 
 
 """ helper """
@@ -310,15 +310,11 @@ class Block(nn.Module):
     ):
         super().__init__()
 
-        self.patch = (
-            Patch(
-                in_size=in_size,
-                out_size=out_size,
-                factor=factor,
-                zero_out=zero_out,
-            )
-            if factor > 1
-            else nn.Identity()
+        self.patch = Patch(
+            in_size=in_size,
+            out_size=out_size,
+            factor=factor,
+            zero_out=zero_out,
         )
 
         self.attn = Attention(
@@ -413,6 +409,8 @@ class Decoder(nn.Module):
 
 
 class FSQ(nn.Module):
+    """finite scalar quantization from deepmind"""
+
     def __init__(
         self,
         config: NeuralTokenizerConfig,
@@ -508,10 +506,11 @@ class NeuralTokenizer(PreTrainedModel):
     def __init__(self, config: NeuralTokenizerConfig):
         super().__init__(config)
 
+        self.padding_idx = config.char_vocab_size
         self.char_embed = nn.Embedding(
-            config.char_vocab_size+1,
+            config.char_vocab_size + 1,
             config.hidden_sizes[0],
-            padding_idx=config.char_vocab_size,
+            padding_idx=self.padding_idx,
         )
 
         self.encoder = Encoder(config)
@@ -530,12 +529,17 @@ class NeuralTokenizer(PreTrainedModel):
         x = [torch.tensor(list(map(ord, s)), dtype=torch.long) for s in x]
 
         # fakepad to block size
-        block_size = find_multiple(torch.cumprod(torch.tensor(self.config.factors), dim=0)[-1].item(), 8)
-        x = [torch.nn.functional.pad(s, (0, find_multiple(s.size(-1), block_size) - s.size(-1)), value=0) for s in x]
-        # assert x[0].size(-1) > 16, x[0].size(-1)
+        block_size = torch.cumprod(torch.tensor(self.config.factors), dim=0)[-1].item()
+
+        x = [
+            torch.nn.functional.pad(
+                s, (0, find_multiple(s.size(-1), block_size) - s.size(-1)), value=0
+            )
+            for s in x
+        ]
 
         # real pad
-        x, mask = pad_tensors(x, pad_value=self.config.char_vocab_size)
+        x, mask = pad_tensors(x, pad_value=self.padding_idx)
         return x, mask
 
     def char_detokenize(self, z: Tensor, mask: Tensor) -> list[str]:
@@ -548,9 +552,23 @@ class NeuralTokenizer(PreTrainedModel):
         out = [s.replace("\x00", "") for s in out]
         return out
 
+    def forward(self, text: list[str]) -> Tensor:
+        char_indices, mask = self.char_tokenize(text)
+        char_emb = self.char_embed.forward(char_indices)
+        codes, mask = self.encoder.forward(char_emb, mask)
+        latent = self.quantizer.forward(codes)
+        hidden, mask = self.decoder.forward(latent, mask)
+        logits = self.head.forward(hidden)
+        xe_loss = F.cross_entropy(
+            input=logits[mask].float().contiguous(),
+            target=char_indices[mask].contiguous(),
+            ignore_index=self.padding_idx,
+        ).mean()
+        return xe_loss
+
     @torch.inference_mode()
-    def encode(self, x: list[str]) -> tuple[Tensor, Tensor]:
-        char_indices, mask = self.char_tokenize(x)   
+    def encode(self, text: list[str]) -> tuple[Tensor, Tensor]:
+        char_indices, mask = self.char_tokenize(text)
         char_emb = self.char_embed.forward(char_indices)
         codes, mask = self.encoder.forward(char_emb, mask)
         indices = self.quantizer.codes_to_indices(codes)
@@ -567,11 +585,3 @@ class NeuralTokenizer(PreTrainedModel):
 
         y = self.char_detokenize(y, mask)
         return y
-
-    def forward(self, x: list[str]) -> Tensor:
-        char_indices = self.char_tokenize(x)
-        codes = self.encoder.forward(char_indices)
-        latent = self.quantizer.forward(codes)
-        logits = self.decoder.forward(latent)
-        xe_loss = F.cross_entropy(logits, char_indices).mean()
-        return xe_loss
