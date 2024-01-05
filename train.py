@@ -9,7 +9,6 @@ args = parser.parse_args()
 exp_name = args.exp_name
 path = os.path.join('configs', exp_name)
 path = path.replace('/', '.')
-print(path)
 
 trainer = importlib.import_module(path).trainer
 trainer.train()
