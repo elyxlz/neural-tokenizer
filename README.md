@@ -1,27 +1,16 @@
-# Loading
-
 # neural-tokenizer
 High compression text tokenizers via VQAEs for efficient and democratic language modeling.
 
 Language models struggle with semantic modeling due to high frequency details in tokens from typical tokenizers, employing stronger textual compression via neural tokenizers may solve alleviate this problem.
 
-# Loading
-```py
-from neural_tokenizer import NeuralTokenizer, NeuralTokenizerConfig
-
-# Random initialization
-model = NeuralTokenizer(NeuralTokenizerConfig())
-
-# Push to huggingface hub
-model = model.push_to_hub("elyxlz/neural-tokenizer-v1")
-
-# Load pretrained model
-model = NeuralTokenizer.from_pretrained("elyxlz/neural-tokenizer-v1")
-```
-
 
 # Usage
 ```python
+from neural_tokenizer import NeuralTokenizer
+
+# Load pretrained model
+model = NeuralTokenizer.from_pretrained("elyxlz/neural-tokenizer-v1")
+
 text = ["Hello", "World :)"]
 tokens = model.encode(text)
 print(tokens.data)
@@ -32,6 +21,7 @@ print(recon)
 # ["Hello", "World :)"]
 
 loss = model.forward(text, max_len=2048)
+# 5.56...
 ```
 
 # Training
@@ -45,23 +35,17 @@ Setup accelerate config
 accelerate config
 ```
 
-Train with a huggingface dataset
-```py
-from neural_tokenizer import Trainer, TrainConfig
+Create a config file like the one in `configs/demo_run.py`
 
-train_config = TrainConfig()
-
-trainer = Trainer(
-    model=model,
-    train_config=train_config
-)
-
-trainer.train()
-
+Then run the training
+```sh
+accelerate launch train.py demo_run
 ```
 
 # TODO
-- [ ] Dataloader with HF datasets
-- [ ] Add training 
+- [x] Dataloader with HF datasets
+- [x] Add training 
+- [ ] Implement varlen windowed flash attn
+- [ ] Validate idea with a simple experiment
 - [ ] GAN training
 - [ ] Variational + continuous bottleneck

@@ -29,13 +29,3 @@ z, mask = model.encode(some_strings)
 recon = model.decode(z, mask)
 
 loss = model.forward(some_strings)
-
-
-def train():
-    train_config = TrainConfig()
-
-    trainer = Trainer(model, train_config)
-    trainer.train()
-
-
-train()
