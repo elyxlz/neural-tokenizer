@@ -5,13 +5,15 @@ from neural_tokenizer import (
     TrainConfig,
 )
 
-model = NeuralTokenizer(NeuralTokenizerConfig(
-    char_vocab_size=256,
-))
+model = NeuralTokenizer(
+    NeuralTokenizerConfig(
+        char_vocab_size=256,
+    )
+)
 
 trainer = Trainer(
     model=model,
     train_config=TrainConfig(
-    name='neural-tokenizer-demo',
-))
-
+        name="neural-tokenizer-demo",
+    ),
+)

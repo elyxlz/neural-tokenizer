@@ -1,8 +1,6 @@
 from neural_tokenizer import (
     NeuralTokenizer,
     NeuralTokenizerConfig,
-    Trainer,
-    TrainConfig,
 )
 
 model = NeuralTokenizer(NeuralTokenizerConfig())
